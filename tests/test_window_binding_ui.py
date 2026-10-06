@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from config import dump_config, load_config
+from analysis import TurnAnalysisWorker
+from sidecar_window import sidecar_settings
 from test_auto_recognition import load_functions
 
 
@@ -117,6 +119,56 @@ class ConfigSaveTests(unittest.TestCase):
                     dump_config({"region": [5, 6, 7, 8]}, str(path))
             self.assertEqual(load_config(str(path)), {"region": [1, 2, 3, 4]})
             self.assertEqual(list(Path(directory).iterdir()), [path])
+
+
+class StartupBindingTests(unittest.TestCase):
+    def test_startup_requires_new_binding_without_capturing_saved_windows_or_regions(self):
+        for saved in (None, {"region": [20, 30, 1500, 900]},
+                      {"region": [20, 30, 1500, 900], "window": {"hwnd": 123},
+                       "custom": "keep", "sidecar": {"width": 640, "enabled": True,
+                                                       "independent_focus": True}}):
+            with self.subTest(saved=saved):
+                before = dict(saved) if saved else None
+                ui = {key: Mock() for key in ("log", "sidecar_enabled", "sidecar_width",
+                       "independent_focus", "status", "sidecar_status", "set_sidecar_layout",
+                       "set_keep_focus_layout", "native_wheel")}
+                capture = Mock(side_effect=AssertionError("startup must not capture"))
+                names = ("setup_diagnostics", "report_callback_exception", "on_destroy", "setup_logger",
+                         "ShotController", "space_press", "space_release", "focus_shot_target",
+                         "verify_shot_target", "report_shot_status", "direction_press", "direction_release",
+                         "direction_tap", "check_shot_state", "refresh_after_shot_change",
+                         "setup_km", "km_listen_queue", "WindowsPanel", "SidecarController",
+                         "report_sidecar_status", "invalidate_sidecar_binding", "recognize_wind",
+                         "recognize", "recognize_ten_units", "OwnTurnDetector", "SnapshotAnalyzer",
+                         "update_controls", "region_prompt", "poll_ui")
+                namespace = {name: Mock() for name in names}
+                namespace.update({
+                    "tkinter": SimpleNamespace(Tk=Mock(return_value=Mock())),
+                    "threading": SimpleNamespace(Thread=Mock()), "_km_queue": None,
+                    "_GAME_CONFIG_PATH": "unused.json", "_PRESS_DURATION_PER_FORCE": .04,
+                    "_game_config": {"region": (10, 20, 1500, 900), "window": {"hwnd": 999}},
+                    "build_ui": Mock(return_value=ui), "load_config": Mock(return_value=saved),
+                    "sidecar_settings": sidecar_settings, "logger": Mock(),
+                    "TurnAnalysisWorker": TurnAnalysisWorker, "capture_game_frame": capture,
+                })
+                state = load_functions("main.py", {"run"}, namespace)
+                state["run"]()
+                worker = state["_analysis_worker"]
+                try:
+                    self.assertFalse(worker.running)
+                    self.assertIsNone(worker.take_result())
+                    capture.assert_not_called()
+                    self.assertNotIn("window", state["_game_config"])
+                    self.assertEqual(state["_game_config"]["region"], (0, 0, 0, 0))
+                    ui["status"].set.assert_called_with("等待绑定游戏窗口")
+                    if saved and "sidecar" in saved:
+                        ui["sidecar_width"].set.assert_called_with("640")
+                        ui["independent_focus"].set.assert_called_with(True)
+                        self.assertEqual(state["_game_config"]["custom"], "keep")
+                    self.assertEqual(saved, before)
+                finally:
+                    worker.close()
+                    worker._thread.join(timeout=2)
 
 
 if __name__ == "__main__":

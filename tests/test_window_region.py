@@ -1,10 +1,12 @@
 """Window/client/screen coordinate checks without touching desktop windows."""
 
 import os
+import ctypes
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from window_region import bind_region, bind_window_at, resolve_region, shot_target, focus_shot_target, verify_shot_target
+from window_region import (WindowsClients, GUIThreadInfo, bind_region, bind_window_at,
+                           resolve_region, shot_target, focus_shot_target, verify_shot_target)
 
 
 class WindowRegionTests(unittest.TestCase):
@@ -56,6 +58,7 @@ class WindowRegionTests(unittest.TestCase):
         focus_shot_target(target,self.clients)
         verify_shot_target(target,self.clients)
         self.clients.activate.assert_called_once_with(123)
+        self.clients.focus_control.assert_not_called()
         self.clients.foreground.return_value = 999
         with self.assertRaisesRegex(ValueError,"失去焦点"):
             verify_shot_target(target,self.clients)
@@ -69,7 +72,7 @@ class WindowRegionTests(unittest.TestCase):
             focus_shot_target(target,self.clients)
         self.clients.info.return_value = self.info
         self.clients.activate.return_value = False
-        with self.assertRaisesRegex(ValueError,"无法切回"):
+        with self.assertRaisesRegex(ValueError,"未能.*激活"):
             focus_shot_target(target,self.clients)
 
     def test_shot_unmarked_region_never_selects_an_external_window(self):
@@ -92,6 +95,8 @@ class AutomaticWindowBindingTests(unittest.TestCase):
         self.clients.root.return_value = 100
         self.clients.children.return_value = [200]
         self.clients.info.side_effect = self.infos.get
+        self.clients.focus_control.return_value = True
+        self.clients.has_keyboard_focus.return_value = True
         self.point = (500, 500)
 
     def bind(self):
@@ -121,8 +126,10 @@ class AutomaticWindowBindingTests(unittest.TestCase):
         self.assertEqual(resolve_region(target, self.clients), (-1198, 126, 1000, 600))
         focus_shot_target(target, self.clients)
         self.clients.activate.assert_called_once_with(100)
+        self.clients.focus_control.assert_called_once_with(200)
         self.clients.foreground.return_value = 100
         verify_shot_target(target, self.clients)
+        self.clients.has_keyboard_focus.assert_called_with(200)
         self.clients.foreground.return_value = 999
         with self.assertRaisesRegex(ValueError, "失去焦点"):
             verify_shot_target(target, self.clients)
@@ -181,6 +188,120 @@ class AutomaticWindowBindingTests(unittest.TestCase):
         target = json.loads(json.dumps(self.bind()))
         self.flash["client"] = (104, 252, 1000, 600)
         self.assertEqual(resolve_region(target, self.clients), (104, 252, 1000, 600))
+
+    def test_activated_hall_without_flash_keyboard_focus_is_rejected(self):
+        target = self.bind()
+        self.clients.activate.return_value = True
+        self.clients.focus_control.return_value = False
+        with self.assertRaisesRegex(ValueError, "大厅已激活"):
+            focus_shot_target(target, self.clients)
+        self.clients.foreground.return_value = 100
+        self.clients.has_keyboard_focus.return_value = False
+        with self.assertRaisesRegex(ValueError, "游戏控件未取得键盘焦点"):
+            verify_shot_target(target, self.clients)
+
+
+class NativeForegroundActivationTests(unittest.TestCase):
+    def setUp(self):
+        self.clients = WindowsClients.__new__(WindowsClients)
+        self.clients.api = Mock()
+        self.clients.api.SetForegroundWindow.return_value = True
+        self.now = 0
+        self.sleep = self.enterContext(patch("window_region.time.sleep", side_effect=self.advance))
+        self.enterContext(patch("window_region.time.monotonic", side_effect=lambda: self.now))
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def test_accepted_activation_waits_through_null_and_old_foreground(self):
+        self.clients.api.GetForegroundWindow.side_effect = [999, None, 999, 123]
+        self.assertTrue(self.clients.activate(123))
+        self.clients.api.SetForegroundWindow.assert_called_once_with(123)
+        self.assertEqual(self.sleep.call_count, 2)
+
+    def test_already_foreground_does_not_request_another_activation(self):
+        self.clients.api.GetForegroundWindow.return_value = 123
+        self.assertTrue(self.clients.activate(123))
+        self.clients.api.SetForegroundWindow.assert_not_called()
+        self.sleep.assert_not_called()
+
+    def test_failed_or_unfinished_activation_times_out_without_retrying(self):
+        for accepted in (False, True):
+            with self.subTest(accepted=accepted):
+                self.now = 0
+                self.clients.api.SetForegroundWindow.reset_mock()
+                self.clients.api.SetForegroundWindow.return_value = accepted
+                self.clients.api.GetForegroundWindow.return_value = 999
+                with self.assertLogs("window_region", level="WARNING") as logs:
+                    self.assertFalse(self.clients.activate(123))
+                self.assertIn("前台=999", logs.output[0])
+                self.assertAlmostEqual(self.now, .5)
+                self.clients.api.SetForegroundWindow.assert_called_once_with(123)
+
+    def test_actual_foreground_is_checked_even_if_api_returns_false(self):
+        self.clients.api.SetForegroundWindow.return_value = False
+        self.clients.api.GetForegroundWindow.side_effect = [999, 123]
+        self.assertTrue(self.clients.activate(123))
+
+
+class NativeKeyboardFocusTests(unittest.TestCase):
+    def setUp(self):
+        self.clients = WindowsClients.__new__(WindowsClients)
+        self.clients.api = Mock()
+        self.clients.kernel = Mock()
+        self.clients.api.GetWindowThreadProcessId.return_value = 20
+        self.clients.kernel.GetCurrentThreadId.return_value = 10
+        self.clients.api.AttachThreadInput.return_value = True
+
+    def test_get_gui_thread_info_uses_target_thread_and_initialized_size(self):
+        def fill(thread, pointer):
+            self.assertEqual(thread, 20)
+            self.assertEqual(pointer._obj.cbSize, ctypes.sizeof(GUIThreadInfo))
+            pointer._obj.hwndFocus = 200
+            return True
+        self.clients.api.GetGUIThreadInfo.side_effect = fill
+        self.assertEqual(self.clients.keyboard_focus(200), 200)
+        self.assertTrue(self.clients.has_keyboard_focus(200))
+
+    def test_queue_created_and_attached_only_around_set_focus(self):
+        with patch.object(self.clients, "has_keyboard_focus", side_effect=[False, True]):
+            self.clients.api.SetFocus.return_value = None
+            self.assertTrue(self.clients.focus_control(200))
+        self.assertEqual([call[0] for call in self.clients.api.mock_calls],
+                         ["GetWindowThreadProcessId", "PeekMessageW", "AttachThreadInput",
+                          "SetFocus", "AttachThreadInput"])
+        self.assertEqual(self.clients.api.AttachThreadInput.call_args_list,
+                         [unittest.mock.call(10, 20, True), unittest.mock.call(10, 20, False)])
+
+    def test_already_focused_control_does_not_attach_or_reset_focus(self):
+        with patch.object(self.clients, "has_keyboard_focus", return_value=True):
+            self.assertTrue(self.clients.focus_control(200))
+        self.clients.api.AttachThreadInput.assert_not_called()
+        self.clients.api.SetFocus.assert_not_called()
+
+    def test_attach_failure_and_set_focus_exception_do_not_leave_queues_attached(self):
+        with patch.object(self.clients, "has_keyboard_focus", return_value=False):
+            self.clients.api.AttachThreadInput.return_value = False
+            self.assertFalse(self.clients.focus_control(200))
+            self.clients.api.SetFocus.assert_not_called()
+            self.clients.api.AttachThreadInput.reset_mock()
+            self.clients.api.AttachThreadInput.return_value = True
+            self.clients.api.SetFocus.side_effect = RuntimeError("focus failed")
+            with self.assertRaises(RuntimeError):
+                self.clients.focus_control(200)
+            self.clients.api.AttachThreadInput.assert_called_with(10, 20, False)
+
+    def test_same_thread_and_descendant_focus(self):
+        self.clients.kernel.GetCurrentThreadId.return_value = 20
+        with patch.object(self.clients, "has_keyboard_focus", side_effect=[False, True]):
+            self.assertTrue(self.clients.focus_control(200))
+        self.clients.api.AttachThreadInput.assert_not_called()
+        with patch.object(self.clients, "keyboard_focus", return_value=201):
+            self.clients.api.IsChild.return_value = True
+            self.assertTrue(self.clients.has_keyboard_focus(200))
+            self.clients.api.IsChild.assert_called_once_with(200, 201)
+        with patch.object(self.clients, "keyboard_focus", return_value=0):
+            self.assertFalse(self.clients.has_keyboard_focus(200))
 
 
 if __name__ == "__main__":

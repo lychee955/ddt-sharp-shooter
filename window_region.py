@@ -3,6 +3,21 @@
 import ctypes
 from ctypes import wintypes
 import os
+import logging
+import time
+
+
+class GUIThreadInfo(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT)]
+
+
+class MonitorInfo(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
 
 
 class WindowsClients:
@@ -10,6 +25,9 @@ class WindowsClients:
         if os.name != "nt":
             raise OSError("窗口跟随仅支持 Windows")
         self.api = ctypes.WinDLL("user32", use_last_error=True)
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel.GetCurrentThreadId.argtypes = []
+        self.kernel.GetCurrentThreadId.restype = wintypes.DWORD
         self.callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         declarations = {
             "EnumWindows": ([self.callback_type, wintypes.LPARAM], wintypes.BOOL),
@@ -23,8 +41,18 @@ class WindowsClients:
             "IsWindow": ([wintypes.HWND], wintypes.BOOL),
             "IsWindowVisible": ([wintypes.HWND], wintypes.BOOL),
             "IsIconic": ([wintypes.HWND], wintypes.BOOL),
+            "GetWindowRect": ([wintypes.HWND, ctypes.POINTER(wintypes.RECT)], wintypes.BOOL),
+            "MonitorFromWindow": ([wintypes.HWND, wintypes.DWORD], wintypes.HANDLE),
+            "GetMonitorInfoW": ([wintypes.HANDLE, ctypes.POINTER(MonitorInfo)], wintypes.BOOL),
+            "GetCursorPos": ([ctypes.POINTER(wintypes.POINT)], wintypes.BOOL),
             "GetForegroundWindow": ([], wintypes.HWND),
             "SetForegroundWindow": ([wintypes.HWND], wintypes.BOOL),
+            "SetFocus": ([wintypes.HWND], wintypes.HWND),
+            "IsChild": ([wintypes.HWND, wintypes.HWND], wintypes.BOOL),
+            "GetGUIThreadInfo": ([wintypes.DWORD, ctypes.POINTER(GUIThreadInfo)], wintypes.BOOL),
+            "AttachThreadInput": ([wintypes.DWORD, wintypes.DWORD, wintypes.BOOL], wintypes.BOOL),
+            "PeekMessageW": ([ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                              wintypes.UINT, wintypes.UINT, wintypes.UINT], wintypes.BOOL),
         }
         for name, (arguments, result) in declarations.items():
             function = getattr(self.api, name)
@@ -53,8 +81,57 @@ class WindowsClients:
         return handles
 
     def activate(self, hwnd):
-        self.api.SetForegroundWindow(hwnd)
-        return self.foreground() == hwnd
+        if self.foreground() == hwnd:
+            return True
+        accepted = bool(self.api.SetForegroundWindow(hwnd))
+        # Cross-thread activation is asynchronous. Immediately afterwards,
+        # GetForegroundWindow may still return the old window, or even NULL.
+        # Wait for the actual foreground window before focusing its control.
+        deadline = time.monotonic() + .5
+        while True:
+            foreground = self.foreground()
+            if foreground == hwnd:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logging.getLogger(__name__).warning(
+                    "窗口激活超时：目标=%s，前台=%s，系统接受=%s",
+                    hwnd, foreground, accepted)
+                return False
+            time.sleep(min(.01, remaining))
+
+    def keyboard_focus(self, hwnd):
+        thread = self.api.GetWindowThreadProcessId(hwnd, None)
+        info = GUIThreadInfo(cbSize=ctypes.sizeof(GUIThreadInfo))
+        if not thread or not self.api.GetGUIThreadInfo(thread, ctypes.byref(info)):
+            raise OSError("无法读取游戏控件的键盘焦点")
+        return int(info.hwndFocus or 0)
+
+    def has_keyboard_focus(self, hwnd):
+        focused = self.keyboard_focus(hwnd)
+        return focused == hwnd or bool(focused and self.api.IsChild(hwnd, focused))
+
+    def focus_control(self, hwnd):
+        if self.has_keyboard_focus(hwnd):
+            return True
+        thread = self.api.GetWindowThreadProcessId(hwnd, None)
+        current = self.kernel.GetCurrentThreadId()
+        if not thread:
+            return False
+        # SetFocus needs a shared input queue. The shot worker may not yet
+        # have a queue; PeekMessage creates one without consuming messages.
+        message = wintypes.MSG()
+        self.api.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)
+        attached = thread != current
+        if attached and not self.api.AttachThreadInput(current, thread, True):
+            return False
+        try:
+            self.api.SetFocus(hwnd)
+        finally:
+            if attached:
+                self.api.AttachThreadInput(current, thread, False)
+        # A NULL SetFocus return can mean there was no previous focus.
+        return self.has_keyboard_focus(hwnd)
 
     def info(self, hwnd):
         if not self.api.IsWindow(hwnd) or not self.api.IsWindowVisible(hwnd) or self.api.IsIconic(hwnd):
@@ -67,6 +144,34 @@ class WindowsClients:
         self.api.GetClassNameW(hwnd, class_name, len(class_name))
         return {"hwnd": int(hwnd), "pid": pid.value, "class_name": class_name.value,
                 "client": (origin.x, origin.y, rectangle.right, rectangle.bottom)}
+
+    def window_state(self, hwnd):
+        """Read identity even when hidden/minimized; never activate the window."""
+        if not self.api.IsWindow(hwnd):
+            return None
+        pid, rectangle = wintypes.DWORD(), wintypes.RECT()
+        self.api.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        name = ctypes.create_unicode_buffer(256)
+        self.api.GetClassNameW(hwnd, name, len(name))
+        if not self.api.GetWindowRect(hwnd, ctypes.byref(rectangle)):
+            raise OSError("无法读取窗口外框")
+        return {"hwnd": int(hwnd), "pid": pid.value, "class_name": name.value,
+                "visible": bool(self.api.IsWindowVisible(hwnd)),
+                "minimized": bool(self.api.IsIconic(hwnd)),
+                "bounds": (rectangle.left, rectangle.top, rectangle.right, rectangle.bottom)}
+
+    def work_area(self, hwnd):
+        monitor = self.api.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        info = MonitorInfo(cbSize=ctypes.sizeof(MonitorInfo))
+        if not monitor or not self.api.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            raise OSError("无法读取游戏所在屏幕的可用范围")
+        return (info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom)
+
+    def cursor_position(self):
+        point = wintypes.POINT()
+        if not self.api.GetCursorPos(ctypes.byref(point)):
+            raise OSError("无法读取鼠标位置")
+        return point.x, point.y
 
 
 def _identity(info):
@@ -181,7 +286,10 @@ def focus_shot_target(target, clients=None):
     clients = clients or WindowsClients()
     resolve_region(target, clients)
     if not clients.activate(target["window"]["hwnd"]):
-        raise ValueError("无法切回游戏窗口，请点击游戏后重新按 ss")
+        raise ValueError("游戏窗口未能在规定时间内激活，请点击游戏画面后重新发射")
+    content = target["window"].get("content")
+    if content and not clients.focus_control(content["hwnd"]):
+        raise ValueError("大厅已激活，但游戏控件未取得键盘焦点；请点击游戏画面后重试发射")
 
 
 def verify_shot_target(target, clients=None):
@@ -189,3 +297,6 @@ def verify_shot_target(target, clients=None):
     resolve_region(target, clients)
     if clients.foreground() != target["window"]["hwnd"]:
         raise ValueError("游戏窗口已失去焦点，未发送发射按键")
+    content = target["window"].get("content")
+    if content and not clients.has_keyboard_focus(content["hwnd"]):
+        raise ValueError("游戏控件未取得键盘焦点，未发送发射按键；请点击游戏画面后重试")

@@ -7,3 +7,4 @@ venv
 *.list
 game_config.json
 .env
+logs/

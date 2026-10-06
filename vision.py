@@ -26,7 +26,31 @@ class Detection:
     manual_self: bool = False
 
 
-def _halo_score(blue, x, y):
+def _map_visibility(rgb):
+    """Exclude the uniform strip below the game's clipped minimap viewport."""
+    height, width = rgb.shape[:2]
+    bottom = height
+    pixels = rgb.astype(float)
+    for y in range(max(3, height // 2), height-3):
+        fill = np.median(pixels[y], axis=0)
+        flat = np.mean(np.linalg.norm(pixels[y:y+3]-fill, axis=2) < 8)
+        edges = np.linalg.norm(pixels[y-2:y+1]-pixels[y-3:y], axis=2)
+        strongest = int(np.argmax(np.mean(edges, axis=1)))
+        if flat >= .85 and np.mean(edges[strongest] > 20) >= .65:
+            # Repeated resizing can blend two rows across the original edge.
+            bottom = y-3+strongest
+            break
+    return np.indices((height, width))[0] < bottom, bottom
+
+
+def _ring_sectors(ring, sectors, visible):
+    # At a clipped boundary require evidence across the visible half-ring;
+    # tiny sector fragments do not count as independent directions.
+    return [i for i in range(12)
+            if np.count_nonzero(ring & visible & (sectors == i)) >= 4]
+
+
+def _halo_score(blue, x, y, visible=None):
     yy, xx = np.indices(blue.shape)
     radius = np.hypot(xx - x, yy - y)
     annulus = (radius >= 10) & (radius <= 15)
@@ -34,12 +58,14 @@ def _halo_score(blue, x, y):
         return 0.0
     angles = (np.arctan2(yy - y, xx - x) + np.pi) * 12 / (2 * np.pi)
     sectors = np.minimum(angles.astype(int), 11)
-    covered = sum(np.any(annulus & blue & (sectors == i)) for i in range(12))
-    coverage = np.mean(blue[annulus])
-    return float(coverage) if covered >= 9 and coverage >= .18 else 0.0
+    visible = np.ones(blue.shape, dtype=bool) if visible is None else visible
+    available = _ring_sectors(annulus, sectors, visible)
+    covered = sum(np.any(annulus & visible & blue & (sectors == i)) for i in available)
+    coverage = np.mean(blue[annulus & visible]) if np.any(annulus & visible) else 0
+    return float(coverage) if len(available) >= 6 and covered >= max(5, .75*len(available)) and coverage >= .18 else 0.0
 
 
-def _faded_halo_score(lab, x, y):
+def _faded_halo_score(lab, x, y, visible=None):
     """Transparent blue rings can look grey over yellow terrain.
 
     Compare the blue/yellow channel with the adjacent background in each
@@ -48,20 +74,52 @@ def _faded_halo_score(lab, x, y):
     yy, xx = np.indices(lab.shape[:2])
     distance = np.hypot(xx-x, yy-y)
     sectors = np.minimum(((np.arctan2(yy-y, xx-x)+np.pi)*12/(2*np.pi)).astype(int), 11)
+    visible = np.ones(lab.shape[:2], dtype=bool) if visible is None else visible
     for radius in range(9, 16):
         ring = (distance >= radius-1.5) & (distance <= radius+1.5)
         outside = (distance >= radius+3) & (distance <= radius+5)
+        available = _ring_sectors(ring, sectors, visible)
         covered = 0
-        for sector in range(12):
-            inner_values = lab[:, :, 2][ring & (sectors == sector)]
-            outer_values = lab[:, :, 2][outside & (sectors == sector)]
+        for sector in available:
+            inner_values = lab[:, :, 2][ring & visible & (sectors == sector)]
+            outer_values = lab[:, :, 2][outside & visible & (sectors == sector)]
             if inner_values.size and outer_values.size:
                 ring_blue = np.median(inner_values)
                 if ring_blue < 22 and np.median(outer_values)-ring_blue >= 12:
                     covered += 1
-        if covered >= 9:
-            return covered/12
+        if len(available) >= 6 and covered >= max(5, .75*len(available)):
+            return covered/len(available)
     return 0.0
+
+
+def _clipped_dot_center(rgb, prop, bottom):
+    """Fit the visible circular arc, never use a half-dot's shifted centroid."""
+    y0, x0, y1, x1 = prop.bbox
+    body_rgb = np.median(rgb[tuple(prop.coords.T)], axis=0)
+    patch = rgb[max(0, y0-2):bottom, max(0, x0-2):x1+2]
+    close = np.linalg.norm(patch.astype(float)-body_rgb, axis=2) < 40
+    contours = measure.find_contours(np.pad(close, 1), .5)
+    if not contours:
+        return None
+    arc = max(contours, key=len)-1
+    arc[:, 0] += max(0, y0-2)
+    arc[:, 1] += max(0, x0-2)
+    arc = arc[arc[:, 0] < bottom-1]
+    if len(arc) < 10 or np.ptp(arc[:, 1]) < 6:
+        return None
+    y, x = arc.T
+    mx, my = np.mean(x), np.mean(y)
+    fit = np.linalg.lstsq(np.column_stack((x-mx, y-my, np.ones(len(x)))),
+                         -((x-mx)**2+(y-my)**2), rcond=None)[0]
+    cx, cy = mx-fit[0]/2, my-fit[1]/2
+    radius_squared = (fit[0]**2+fit[1]**2)/4-fit[2]
+    if not 4**2 <= radius_squared <= 8.5**2:
+        return None
+    radius = np.sqrt(radius_squared)
+    residual = np.sqrt(np.mean((np.hypot(x-cx, y-cy)-radius)**2))
+    if residual > .55 or not x0 <= cx < x1 or not bottom-7 <= cy <= bottom+1:
+        return None
+    return float(cx), float(cy)
 
 
 def recognize_players(image: np.ndarray, pixel_scale: float = 1.0, own_hint=None, *, manual_hint=None) -> Detection:
@@ -78,6 +136,7 @@ def recognize_players(image: np.ndarray, pixel_scale: float = 1.0, own_hint=None
     blue = (hue >= .58) & (hue <= .70) & (saturation > .8) & (value > .65)
     lab = color.rgb2lab(normalized)
     rgb_float = normalized.astype(float)
+    visible, bottom = _map_visibility(normalized)
     candidates, masks = [], []
     # Overlapping hue bands find coloured dots of any hue; neutral bands
     # support white/grey dots too. Team colours are never predefined.
@@ -96,21 +155,29 @@ def recognize_players(image: np.ndarray, pixel_scale: float = 1.0, own_hint=None
             masks.append(np.linalg.norm(rgb_float-rgb, axis=2) < 20)
     yy, xx = np.indices(hue.shape)
     for mask in masks:
+        mask = mask & visible
         mask = morphology.binary_opening(mask, morphology.disk(1))
         for prop in measure.regionprops(measure.label(mask)):
             y0, x0, y1, x1 = prop.bbox
             h, w = y1 - y0, x1 - x0
-            if not (7 <= w <= 24 and 7 <= h <= 18 and 45 <= prop.area <= 240):
+            clipped = y1 >= bottom-1
+            if not (7 <= w <= 24 and (4 if clipped else 7) <= h <= 18
+                    and (20 if clipped else 45) <= prop.area <= 240):
                 continue
-            if prop.extent < .45 or prop.solidity < .80 or prop.axis_minor_length / max(prop.axis_major_length, 1) < .5:
+            if prop.extent < .45 or prop.solidity < .80 or (not clipped and prop.axis_minor_length / max(prop.axis_major_length, 1) < .5):
                 continue
             cy, cx = prop.centroid
-            if min(cx, cy, width/pixel_scale-cx, height/pixel_scale-cy) < 8:
+            if clipped:
+                center = _clipped_dot_center(normalized, prop, bottom)
+                if center is None:
+                    continue
+                cx, cy = center
+            if min(cx, cy, normalized.shape[1]-cx) < 8 or (not clipped and normalized.shape[0]-cy < 8):
                 continue
             radius = np.hypot(xx - cx, yy - cy)
-            core = radius <= 3
-            ring = (radius >= 8) & (radius <= 10)
-            if not np.any(ring):
+            core = (radius <= 3) & visible
+            ring = (radius >= 8) & (radius <= 10) & visible
+            if np.count_nonzero(core) < 6 or not np.any(ring):
                 continue
             # Player dots have a flat centre; illustrated terrain has shading.
             if np.max(np.std(rgb_float[core], axis=0)) > 4:
@@ -120,16 +187,17 @@ def recognize_players(image: np.ndarray, pixel_scale: float = 1.0, own_hint=None
             if np.linalg.norm(body_lab - background) < 12:
                 continue
             body_rgb = tuple(int(v) for v in np.median(normalized[core], axis=0))
-            inner = radius <= 4.5
+            inner = (radius <= 4.5) & visible
             close = np.linalg.norm(rgb_float - body_rgb, axis=2) < 40
             if np.mean(close[inner]) < .85:
                 continue
-            outer = (radius >= 7.5) & (radius <= 9.5)
+            outer = (radius >= 7.5) & (radius <= 9.5) & visible
             if np.mean(close[outer]) > .2:
                 continue
-            body = close & (radius <= 7)
+            body = close & (radius <= 7) & visible
             body_y, body_x = np.where(body)
-            cx, cy = float(np.mean(body_x)), float(np.mean(body_y))
+            if not clipped:
+                cx, cy = float(np.mean(body_x)), float(np.mean(body_y))
             quality = float(np.count_nonzero(body))
             candidates.append((quality, cx, cy, body_rgb, body_lab))
     unique = []
@@ -148,7 +216,7 @@ def recognize_players(image: np.ndarray, pixel_scale: float = 1.0, own_hint=None
                              error_kind="self_ambiguous")
     else:
         selves = [i for i, (_, cx, cy, _, _) in enumerate(unique)
-                  if _halo_score(blue, cx, cy) or _faded_halo_score(lab, cx, cy)]
+                  if _halo_score(blue, cx, cy, visible) or _faded_halo_score(lab, cx, cy, visible)]
     used_hint = False
     if not selves and own_hint is not None:
         matches = [i for i, p in enumerate(raw)

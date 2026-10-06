@@ -34,6 +34,7 @@ class AutoRecognitionTests(unittest.TestCase):
             "cancel_region_selection", "start_region_selection",
             "capture_game_frame",
             "poll_ui",
+            "poll_ui_events",
             "close_force_dialog",
         }, {
             "math": math,
@@ -314,13 +315,48 @@ class AutoRecognitionTests(unittest.TestCase):
         worker = self.state["_analysis_worker"] = Mock()
         for key in "ttl30tyyt":
             self.state["handle_inputs"](key)
-        self.assertEqual(worker.refresh.call_count, 4)
+        worker.refresh.assert_not_called()
+        self.assertEqual(self.state["_ui_actions"].put.call_args_list,
+                         [unittest.mock.call(("refresh", None))]*4)
         self.state["fire"].assert_not_called()
         self.state["space_press"].assert_not_called()
 
+    def test_global_q_never_quits_in_analysis_manual_or_during_binding(self):
+        for mode, drag, overlay, busy in (("auto", None, None, False),
+                                         ("manual", None, None, False),
+                                         ("auto", {"running": True}, None, False),
+                                         ("auto", None, Mock(), False),
+                                         ("auto", None, None, True)):
+            with self.subTest(mode=mode, drag=drag, busy=busy):
+                self.state.update(_mode=mode, _window_drag=drag, _region_overlay=overlay,
+                                  _shot_controller=Mock(busy=busy))
+                self.state["_ui_actions"].reset_mock()
+                self.state["handle_inputs"]("q")
+                self.state["_ui_actions"].put.assert_not_called()
+                self.state["_shot_controller"].cancel.assert_not_called()
+
+    def test_ui_poll_exception_is_logged_and_next_poll_is_scheduled(self):
+        worker = self.state["_analysis_worker"] = Mock()
+        worker.take_result.side_effect = RuntimeError("bad snapshot")
+        self.state.update(_ui_actions=Queue(), _stop_signal=False, _mode="auto", _tk=Mock())
+        self.state["poll_ui"]()
+        self.state["logger"].exception.assert_called_once()
+        self.state["_tk"].after.assert_called_once_with(100, self.state["poll_ui"])
+        worker.take_result.side_effect = None
+        worker.take_result.return_value = None
+        self.state["expire_stale_result"] = Mock()
+        self.state["poll_ui"]()
+        self.assertEqual(self.state["_tk"].after.call_count, 2)
+
+    def test_stopped_ui_poll_does_not_schedule_or_read_results(self):
+        self.state.update(_stop_signal=True, _tk=Mock(), _analysis_worker=Mock())
+        self.state["poll_ui"]()
+        self.state["_tk"].after.assert_not_called()
+        self.state["_analysis_worker"].take_result.assert_not_called()
+
     def test_fire_is_blocked_in_analysis_mode(self):
         self.state["_mode"] = "auto"
-        with self.assertRaisesRegex(ValueError, "只显示力度"):
+        with self.assertRaisesRegex(ValueError, "选中行点击发射"):
             self.real_fire(30)
         self.state["space_press"].assert_not_called()
 
