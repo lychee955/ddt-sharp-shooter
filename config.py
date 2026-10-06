@@ -4,6 +4,7 @@ This module provides functions to load and dump configurations
 
 import os
 import json
+import tempfile
 from typing import Any
 
 
@@ -34,5 +35,14 @@ def dump_config(config: dict[str, Any], config_path: str) -> None:
         config (dict[str, Any]): The configuration to dump.
         config_path (str): The path to the configuration file.
     """
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=4)
+    # Keep the previous binding intact if writing or replacing the file fails.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
+                                         dir=os.path.dirname(os.path.abspath(config_path))) as f:
+            temporary = f.name
+            json.dump(config, f, indent=4)
+        os.replace(temporary, config_path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)

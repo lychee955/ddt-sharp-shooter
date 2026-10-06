@@ -1,12 +1,21 @@
+import math
 import re
-import sys
 import threading
 import time
 import tkinter
-from queue import Queue
+from dataclasses import replace
+from tkinter import ttk
+from tkinter import font as tkfont
+from queue import Empty, Queue
+
+from PIL import Image, ImageTk
 
 from pyautogui import Point
+from analysis import AnalysisWorker, TurnAnalysisWorker, MINIMAP_REGION, SnapshotAnalyzer, analyze_frame
+from turn import OwnTurnDetector
 from config import dump_config, load_config
+from window_region import bind_region, bind_window_at, resolve_region, shot_target, focus_shot_target, verify_shot_target
+from shot import ShotController, parse_force
 from logger import logger, setup_logger
 from force import calc_force
 from km import (
@@ -16,7 +25,7 @@ from km import (
     setup as setup_km,
     stop_listen as km_stop_listen,
 )
-from ocr import recognize, recognize_force, recognize_ten_units, recognize_wind
+from ocr import _capture_region, recognize, recognize_force, recognize_ten_units, recognize_wind
 
 
 _GAME_CONFIG_PATH = "game_config.json"
@@ -24,7 +33,7 @@ _PRESS_DURATION_PER_FORCE = 4 / 100
 _REF_GAME_REGION_WIDTH = 1500
 _WIND_REGION = (709, 22, 84, 54)  # (x, y, w, h)
 _DEG_REGION = (43, 835, 64, 36)  # (x, y, w, h)
-_MINIMAP_REGION = (1230, 45, 255, 140)  # (x, y, w, h)
+_MINIMAP_REGION = MINIMAP_REGION  # Includes both edges and the full viewport.
 _FORCE_REGION = (225, 860, 745, 28)  # (x, y, w, h)
 _cmd_flag = 0
 _cmd_typing = ""
@@ -37,12 +46,36 @@ _ten_units_pixels = 0
 _enemy_pos: tuple[int, int, int] | None = None  # dx, dy, enemy_left_side
 _tmp_pos: Point = None
 _tk: tkinter.Tk
+AUTO_MODE = "自动分析（只显示）"
+MANUAL_MODE = "原有发射模式"
+_mode = AUTO_MODE
+_analysis_worker: AnalysisWorker | None = None
+_ui_actions = Queue()
+_ui = {}
+_preview_photo = None
+_parameter_photos = []
+_region_overlay = None
+_region_canvas = None
+_region_corner = None
+_window_drag = None
+_last_valid_result = None
+_last_valid_at = None
+_pending_failure = None
+_displayed_result = None
+_fire_cancel = threading.Event()
+_shot_controller = None
+_force_dialog = None
+_force_dialog_pending = False
+_last_s_press = None
+_dialog_escape_until = 0
 
 
 def km_listen_queue():
     global _stop_signal
     while not _stop_signal:
         inputs = _km_queue.get()
+        if _stop_signal:
+            break
         handle_inputs(inputs)
 
 
@@ -54,7 +87,7 @@ def resolve_force():
     """
     var_val = {"w": 0, "x": 0, "y": 0, "d": 0, "l": 0}
     try:
-        for var, val in re.findall(r"([lwxyd])(-?\d+.?\d+)", _cmd_typing):
+        for var, val in re.findall(r"([lwxyd])(-?\d+(?:\.\d+)?)", _cmd_typing):
             var_val[var] = float(val)
         if var_val["l"]:
             logger.info(f"Direct force:\n {var_val['l']}")
@@ -68,36 +101,46 @@ def resolve_force():
         logger.info("输入无效: 请检查输入格式.")
 
 
+def _screen_region(reference_region: tuple[int, int, int, int]):
+    """Scale offsets within the game, then add its screen position."""
+    x, y, width, height = resolve_region(_game_config)
+    if width <= 0 or height <= 0:
+        raise ValueError("游戏区域无效，请拖动瞄准图标绑定游戏窗口")
+    ratio = width / _REF_GAME_REGION_WIDTH
+    rx, ry, rw, rh = reference_region
+    region = (
+        int(x + rx * ratio),
+        int(y + ry * ratio),
+        int(rw * ratio),
+        int(rh * ratio),
+    )
+    if region[2] <= 0 or region[3] <= 0:
+        raise ValueError("游戏区域过小，请重新标记完整游戏画面")
+    return region
+
+
 def recognize_and_fire():
     global _ten_units_pixels
+    if _enemy_pos is None:
+        raise ValueError("未标记敌我位置，请用 y 先标记自己、再标记敌人")
     dx, dy, enemy_left_side = _enemy_pos
-    x, y, w, _ = _game_config["region"]
-    pos_adjust_ratio = w / _REF_GAME_REGION_WIDTH
 
     if not _ten_units_pixels:
         logger.info("十屏距离未标记，尝试自动识别...")
-        rect_res = recognize_ten_units(
-            (
-                int((x + _MINIMAP_REGION[0]) * pos_adjust_ratio),
-                int((y + _MINIMAP_REGION[1]) * pos_adjust_ratio),
-                int(_MINIMAP_REGION[2] * pos_adjust_ratio),
-                int(_MINIMAP_REGION[3] * pos_adjust_ratio),
-            )
-        )
+        rect_res = recognize_ten_units(_screen_region(_MINIMAP_REGION))
+        if rect_res <= 0:
+            raise ValueError("小地图标尺识别失败，请检查游戏区域、小地图是否被遮挡")
         _ten_units_pixels = rect_res
+
+    if _ten_units_pixels <= 0:
+        _ten_units_pixels = 0
+        raise ValueError("小地图标尺无效，请按 Esc 后重新标记")
 
     dx = dx / _ten_units_pixels * 10
     dy = dy / _ten_units_pixels * 10
     logger.info(f"十屏距离: {_ten_units_pixels}, dx: {dx}, dy: {dy}")
 
-    wind, left_more_dark = recognize_wind(
-        (
-            int(x + _WIND_REGION[0] * pos_adjust_ratio),
-            int(y + _WIND_REGION[1] * pos_adjust_ratio),
-            int(_WIND_REGION[2] * pos_adjust_ratio),
-            int(_WIND_REGION[3] * pos_adjust_ratio),
-        )
-    )
+    wind, left_more_dark = recognize_wind(_screen_region(_WIND_REGION))
     wind = wind * (
         -1
         if left_more_dark
@@ -107,15 +150,13 @@ def recognize_and_fire():
         else 1
     )
     logger.info(f"风速: {wind}")
-    deg = recognize(
-        (
-            int(x + _DEG_REGION[0] * pos_adjust_ratio),
-            int(y + _DEG_REGION[1] * pos_adjust_ratio),
-            int(_DEG_REGION[2] * pos_adjust_ratio),
-            int(_DEG_REGION[3] * pos_adjust_ratio),
-        )
-    )
+    deg = recognize(_screen_region(_DEG_REGION)).strip()
+    if not deg.isdigit() or not 0 <= int(deg) <= 180:
+        raise ValueError(f"角度识别失败（结果：{deg!r}），请检查角度显示区域")
+    logger.info(f"角度: {deg}")
     force = calc_force(int(deg), wind, dx, dy)
+    if not math.isfinite(force) or not 0 < force <= 100:
+        raise ValueError(f"发射力度无效：{force}，应在 0 到 100 之间（不含 0）")
     fire(force)
 
 
@@ -133,18 +174,77 @@ def reset_inputs(new_game=False):
 def handle_inputs(inputs: str):
     """To handle inputs"""
     global _cmd_flag, _cmd_typing, _tmp_pos, _ten_units_pixels, _enemy_pos
+    global _last_s_press, _force_dialog_pending, _dialog_escape_until
 
     if not inputs:
         return
 
+    drag = _window_drag
+    if drag is not None:
+        if inputs == "esc":
+            drag["cancelled"] = True
+            _ui_actions.put(("cancel_binding", None))
+        elif inputs == "q":
+            _ui_actions.put(("quit", None))
+        return
+
+    if _force_dialog is not None or _force_dialog_pending:
+        if inputs == "esc":
+            _force_dialog_pending = False
+            _dialog_escape_until = time.monotonic()+.25
+            _ui_actions.put(("cancel_force",None))
+        return
+
+    now = time.monotonic()
+    if inputs == "esc" and _dialog_escape_until and now < _dialog_escape_until:
+        return
+    previous_s = _last_s_press
+    _last_s_press = None
+    if inputs.lower() == "s" and _region_overlay is None:
+        if _shot_controller is not None and _shot_controller.busy:
+            return
+        if previous_s is not None and now-previous_s <= .5:
+            _force_dialog_pending = True
+            _ui_actions.put(("force_dialog",None))
+        else:
+            _last_s_press = now
+        return
+
+    if inputs == "r":
+        _fire_cancel.set()
+        if _shot_controller is not None:
+            _shot_controller.cancel()
+        _ui_actions.put(("mark_region", None))
+        return
+
+    if _region_overlay is not None and inputs not in {"esc", "q"}:
+        return
+
+    if _shot_controller is not None and _shot_controller.busy:
+        if inputs not in {"esc","q"}:
+            return
+
+    # Analysis never fires; ss opens a separate user-confirmed shot dialog.
+    if _mode == AUTO_MODE:
+        if inputs == "t":
+            if _analysis_worker:
+                _analysis_worker.refresh()
+            return
+        if inputs not in {"esc", "q"}:
+            return
+
     # press ESC to cancel
     if inputs == "esc":
-        reset_inputs(True)
+        _fire_cancel.set()
+        if _shot_controller is not None:
+            _shot_controller.cancel()
+        _ui_actions.put(("paused", None))
     elif inputs == "q":
         # press 'q' to quit
         logger.info("退出.")
-        _tk.quit()
-        sys.exit()
+        if _shot_controller is not None:
+            _shot_controller.cancel()
+        _ui_actions.put(("quit", None))
     # press the key 't' twice to enable command mode
     elif inputs == "t":
         if _cmd_flag == 2:
@@ -152,16 +252,20 @@ def handle_inputs(inputs: str):
                 if _enemy_pos:
                     try:
                         recognize_and_fire()
-                    except Exception:
-                        logger.info("关键参数识别失败，炸膛！")
+                    except Exception as exc:
+                        logger.exception("自动识别或发射失败")
+                        logger.info(f"失败原因：{type(exc).__name__}: {exc}")
                         time.sleep(1)
                 elif _cmd_typing:
-                    direct_force = resolve_force()
-                    if direct_force and direct_force > 0:
-                        fire(force=direct_force)
-                    else:
-                        logger.info("输入无效: 请检查输入格式.")
-                        time.sleep(1)
+                    try:
+                        direct_force = resolve_force()
+                        if direct_force and direct_force > 0:
+                            fire(force=direct_force)
+                        else:
+                            logger.info("输入无效: 请检查输入格式.")
+                    except Exception as exc:
+                        logger.exception("手动发射失败")
+                        logger.info(f"失败原因：{type(exc).__name__}: {exc}")
                 reset_inputs()
                 return
         _cmd_flag += 1
@@ -173,23 +277,6 @@ def handle_inputs(inputs: str):
     elif _cmd_flag == 2:
         if inputs == "delete":
             _cmd_typing = _cmd_typing[:-1]
-        elif (
-            inputs == "r"
-        ):  # press and release 'r' to set game region (cooperated with mouse position)
-            if _tmp_pos:
-                pos = get_curr_mouse_pos()
-                _game_config["region"] = (
-                    _tmp_pos.x,
-                    _tmp_pos.y,
-                    pos.x - _tmp_pos.x,
-                    pos.y - _tmp_pos.y,
-                )
-                dump_config(_game_config, _GAME_CONFIG_PATH)
-                logger.info(f"游戏区域: {_game_config['region']}")
-                _tmp_pos = None
-                return
-            logger.info("设置游戏区域.")
-            _tmp_pos = get_curr_mouse_pos()
         elif inputs == "e":
             if _tmp_pos:
                 pos = get_curr_mouse_pos()
@@ -227,15 +314,7 @@ def calc_duration(force):
 
 
 def _get_curr_force():
-    pos_adjust_ratio = _game_config["region"][2] / _REF_GAME_REGION_WIDTH
-    return recognize_force(
-        (
-            int((_game_config["region"][0] + _FORCE_REGION[0]) * pos_adjust_ratio),
-            int((_game_config["region"][1] + _FORCE_REGION[1]) * pos_adjust_ratio),
-            int(_FORCE_REGION[2] * pos_adjust_ratio),
-            int(_FORCE_REGION[3] * pos_adjust_ratio),
-        )
-    )
+    return recognize_force(_screen_region(_FORCE_REGION))
 
 
 def fire(force: int):
@@ -244,46 +323,642 @@ def fire(force: int):
     - Press space to store force,
     and then release to fire
     """
-    time.sleep(1.5)
+    if _mode != MANUAL_MODE:
+        raise ValueError("自动分析模式只显示力度，不执行发射")
+    if not math.isfinite(force) or not 0 < force <= 100:
+        raise ValueError("发射力度应大于 0 且不超过 100")
+    _fire_cancel.clear()
+    if _fire_cancel.wait(1.5) or _mode != MANUAL_MODE:
+        return
     logger.info(f"发射力度: {force}")
     logger.info("发射!")
     space_press()
-    time.sleep(_PRESS_DURATION_PER_FORCE * force)
-    space_release()
+    try:
+        _fire_cancel.wait(_PRESS_DURATION_PER_FORCE * force)
+    finally:
+        space_release()
 
 
-def on_destroy(_):
+def on_destroy(_=None):
     global _stop_signal
     _stop_signal = True
+    _fire_cancel.set()
+    cancel_window_binding(resume=False)
+    if _shot_controller is not None:
+        _shot_controller.close()
+    close_force_dialog()
+    if _analysis_worker:
+        _analysis_worker.close()
     # put something to break the km_queue blocking
     _km_queue.put("stop")
     km_stop_listen()
+    _tk.destroy()
+
+
+def select_mode():
+    global _mode
+    _fire_cancel.set()
+    if _shot_controller is not None:
+        _shot_controller.cancel()
+    close_force_dialog()
+    cancel_window_binding(resume=False)
+    if _region_overlay is not None:
+        cancel_region_selection()
+    _mode = _ui["mode"].get()
+    reset_inputs(True)
+    _analysis_worker.configure(_game_config["region"], _mode == AUTO_MODE)
+    clear_results("自动分析只显示结果" if _mode == AUTO_MODE else "发射模式：tt 开启输入，y 标记或输入 l30，t 发射")
+    update_controls()
+
+
+def toggle_analysis():
+    if _mode != AUTO_MODE:
+        return
+    if _analysis_worker.running:
+        _analysis_worker.pause()
+        _ui["status"].set("已暂停监听，保留上次结果；t 可手动计算一次")
+    else:
+        _analysis_worker.configure(_game_config["region"], True)
+        _ui["status"].set("等待轮到你出手；t 可手动计算一次" if _game_config["region"][2] > 0 else "请将瞄准图标拖到游戏画面内绑定窗口")
+    update_controls()
+
+
+def refresh_analysis():
+    if _mode == AUTO_MODE:
+        _analysis_worker.refresh()
+
+
+def update_controls():
+    automatic = _mode == AUTO_MODE
+    selecting = _region_overlay is not None or _window_drag is not None
+    _ui["start"].configure(text="暂停监听" if _analysis_worker.running else "开始监听",
+                           state="normal" if automatic and not selecting else "disabled")
+    _ui["refresh"].configure(state="normal" if automatic and not selecting else "disabled")
+    _ui["mark"].configure(state="disabled" if selecting else "normal")
+
+
+def prepare_window_binding(_=None):
+    global _window_drag, _last_s_press
+    if _window_drag is not None or _region_overlay is not None:
+        return False
+    _window_drag = {"running": _analysis_worker.running}
+    _fire_cancel.set()
+    if _shot_controller is not None:
+        _shot_controller.cancel()
+    close_force_dialog()
+    _last_s_press = None
+    _analysis_worker.pause()
+    reset_inputs(True)
+    _ui["status"].set("拖到游戏画面内松开即可绑定；Esc 取消")
+    region_prompt("正在绑定窗口：避开工具栏和下方力度表")
+    update_controls()
+    return True
+
+
+def start_window_drag(_=None):
+    if not prepare_window_binding():
+        return "break"
+    try:
+        _ui["finder"].configure(cursor="crosshair")
+        _ui["finder"].grab_set_global()
+        _tk.configure(cursor="crosshair")
+    except tkinter.TclError:
+        cancel_window_binding()
+    return "break"
+
+
+def release_window_drag():
+    global _window_drag
+    previous = _window_drag
+    _window_drag = None
+    for widget, cursor in ((_ui.get("finder"), "hand2"), (_tk, "")):
+        if widget is not None:
+            try:
+                widget.grab_release()
+                widget.configure(cursor=cursor)
+            except tkinter.TclError:
+                pass
+    return previous
+
+
+def cancel_window_binding(_=None, *, resume=True):
+    global _dialog_escape_until
+    if _window_drag is not None:
+        if getattr(_, "keysym", None) == "Escape":
+            _dialog_escape_until = time.monotonic()+.25
+        previous = release_window_drag()
+        if resume:
+            _analysis_worker.configure(_game_config["region"], previous["running"])
+        region_prompt("已取消绑定，原窗口保留；将瞄准图标拖到游戏内可重新绑定")
+        _ui["status"].set("等待轮到你出手" if resume and previous["running"] else "已暂停")
+        update_controls()
+    return "break"
+
+
+def finish_window_binding(point):
+    global _game_config, _ten_units_pixels, _enemy_pos, _tmp_pos
+    if _window_drag is None:
+        return "break"
+    if _window_drag.get("cancelled"):
+        return cancel_window_binding()
+    previous = release_window_drag()
+    try:
+        target = bind_window_at(point)
+        config = dict(_game_config, **target)
+        # Validate again before saving in case the game was closed during lookup.
+        config["region"] = resolve_region(config)
+        dump_config(config, _GAME_CONFIG_PATH)
+    except Exception as exc:
+        _analysis_worker.configure(_game_config["region"], previous["running"])
+        region_prompt(f"绑定失败：{exc}；原窗口保留")
+        _ui["status"].set("绑定未更改，请将图标拖到完整游戏画面内重试")
+        update_controls()
+        return "break"
+    _game_config = config
+    _ten_units_pixels, _enemy_pos, _tmp_pos = 0, None, None
+    clear_results("等待轮到你出手；t 可手动计算一次" if _mode == AUTO_MODE else "游戏窗口已绑定")
+    _analysis_worker.configure(config["region"], _mode == AUTO_MODE)
+    width, height = config["region"][2:]
+    region_prompt(f"已绑定游戏窗口（{width} × {height}），移动和缩放后自动跟随")
+    logger.info(f"窗口绑定成功，游戏区域：{config['region']}")
+    update_controls()
+    return "break"
+
+
+def finish_window_drag(event):
+    return finish_window_binding((event.x_root, event.y_root))
+
+
+def bind_game_under_mouse():
+    if prepare_window_binding():
+        finish_window_binding(tuple(get_curr_mouse_pos()))
+
+
+def region_prompt(message):
+    _ui["calibration"].set(message)
+    if _region_canvas is not None:
+        _region_canvas.itemconfigure("prompt", text=message+"\n只标游戏画面，不包含标题栏或下方参考表。Esc 取消")
+    logger.info(message)
+
+
+def close_region_overlay():
+    global _region_overlay, _region_canvas, _region_corner
+    overlay = _region_overlay
+    # Clear state first: a repeated local/global Escape must not destroy or
+    # release the same overlay twice, even if Tk reports it already closed.
+    _region_overlay = _region_canvas = _region_corner = None
+    if overlay is not None:
+        try:
+            overlay.grab_release()
+        except tkinter.TclError:
+            pass
+        try:
+            overlay.destroy()
+        except tkinter.TclError:
+            pass
+
+
+def cancel_region_selection(_=None):
+    if _region_overlay is None:
+        return "break"
+    close_region_overlay()
+    region_prompt("已取消校准，原游戏区域保留；拖动图标绑定或点击精细校准重新开始")
+    _ui["status"].set("已暂停")
+    update_controls()
+    return "break"
+
+
+def record_region_corner(pos):
+    global _region_corner, _ten_units_pixels, _enemy_pos, _tmp_pos, _game_config
+    if _region_corner is None:
+        _region_corner = pos
+        region_prompt("左上角已标记，请点击游戏画面右下角")
+        return
+    if pos.x <= _region_corner.x or pos.y <= _region_corner.y:
+        region_prompt("右下角位置无效，请在已标记左上角的右下方重新点击")
+        return
+    region = (_region_corner.x, _region_corner.y,
+              pos.x-_region_corner.x, pos.y-_region_corner.y)
+    config = dict(_game_config, region=region)
+    config.pop("window", None)
+    binding = bind_region(region)
+    if binding is not None:
+        config["window"] = binding
+    try:
+        dump_config(config, _GAME_CONFIG_PATH)
+    except Exception as exc:
+        region_prompt(f"游戏区域保存失败：{exc}；请重试点击右下角")
+        return
+    _game_config = config
+    _ten_units_pixels, _enemy_pos, _tmp_pos = 0, None, None
+    close_region_overlay()
+    clear_results("等待轮到你出手；t 可手动计算一次" if _mode == AUTO_MODE else "游戏区域已更新")
+    follow = "；已绑定窗口，移动后自动跟随" if binding else "；使用固定区域，移动后请重新标记"
+    region_prompt("游戏区域标记成功，已保存"+follow+ ("；自动分析已恢复" if _mode == AUTO_MODE else ""))
+    logger.info(f"游戏区域：{region}")
+    _analysis_worker.configure(region, _mode == AUTO_MODE)
+    update_controls()
+
+
+def start_region_selection():
+    global _region_overlay, _region_canvas, _region_corner
+    if _window_drag is not None:
+        return
+    if _region_overlay is not None:
+        _region_overlay.lift()
+        return
+    _fire_cancel.set()
+    if _shot_controller is not None:
+        _shot_controller.cancel()
+    close_force_dialog()
+    _analysis_worker.pause()
+    reset_inputs(True)
+    clear_results("正在设置游戏区域，自动分析已暂停")
+    _region_corner = None
+    overlay = tkinter.Toplevel(_tk)
+    _region_overlay = overlay
+    overlay.overrideredirect(True)
+    x, y = _tk.winfo_vrootx(), _tk.winfo_vrooty()
+    width, height = _tk.winfo_vrootwidth(), _tk.winfo_vrootheight()
+    overlay.geometry(f"{width}x{height}{x:+d}{y:+d}")
+    overlay.wm_attributes("-topmost", True)
+    overlay.wm_attributes("-alpha", .4)
+    _region_canvas = tkinter.Canvas(overlay, bg="#101820", highlightthickness=0, cursor="crosshair")
+    _region_canvas.pack(fill="both", expand=True)
+    _region_canvas.create_text(width/2, 70, fill="white", font=("Microsoft YaHei", 16, "bold"),
+                               tags="prompt", width=width-80, justify="center")
+    # Wait for release so both mouse events are consumed by the overlay.
+    _region_canvas.bind("<ButtonRelease-1>", lambda event: record_region_corner(Point(event.x_root, event.y_root)))
+    def outline(event):
+        _region_canvas.delete("selection")
+        if _region_corner is not None:
+            _region_canvas.create_rectangle(_region_corner.x-x, _region_corner.y-y,
+                                            event.x, event.y, outline="#50cfff", width=3, tags="selection")
+    _region_canvas.bind("<Motion>", outline)
+    overlay.bind("<Escape>", cancel_region_selection)
+    overlay.grab_set()
+    overlay.focus_force()
+    region_prompt("请点击游戏画面左上角")
+    update_controls()
+
+
+def close_force_dialog(_=None):
+    global _force_dialog, _force_dialog_pending, _last_s_press, _dialog_escape_until
+    if getattr(_,"keysym",None) == "Escape":
+        # Tk and the global listener receive the same physical Escape.
+        # Its later copy should not pause analysis after closing the dialog.
+        _dialog_escape_until = time.monotonic()+.25
+    dialog = _force_dialog
+    _force_dialog = None
+    _force_dialog_pending = False
+    _last_s_press = None
+    if dialog is not None:
+        for operation in (dialog.grab_release,dialog.destroy):
+            try:
+                operation()
+            except tkinter.TclError:
+                pass
+    return "break"
+
+
+def open_force_dialog():
+    global _force_dialog, _force_dialog_pending, _dialog_escape_until
+    if not _force_dialog_pending or _force_dialog is not None:
+        return
+    _force_dialog_pending = False
+    if _region_overlay is not None or _window_drag is not None or _shot_controller is None or _shot_controller.busy:
+        return
+    try:
+        target = shot_target(_game_config)
+    except (ValueError,OSError) as exc:
+        _ui["status"].set(str(exc))
+        return
+    _dialog_escape_until = 0
+    reset_inputs()
+    dialog = _force_dialog = tkinter.Toplevel(_tk)
+    dialog.title("指定力度发射")
+    dialog.transient(_tk)
+    dialog.resizable(False,False)
+    dialog.wm_attributes("-topmost",True)
+    frame = ttk.Frame(dialog,padding=16)
+    frame.pack(fill="both",expand=True)
+    ttk.Label(frame,text="输入力度（大于 0，最大 100，支持小数）").pack(anchor="w")
+    value = tkinter.StringVar()
+    entry = ttk.Entry(frame,textvariable=value,width=30)
+    entry.pack(fill="x",pady=10)
+    error = tkinter.StringVar()
+    ttk.Label(frame,textvariable=error,foreground="#b33b30").pack(anchor="w")
+    def submit(_=None):
+        if _force_dialog is not dialog:
+            return "break"
+        try:
+            force = parse_force(value.get())
+        except ValueError as exc:
+            error.set(str(exc))
+            entry.focus_set()
+            return "break"
+        close_force_dialog()
+        if _shot_controller.submit(force,target):
+            _ui["status"].set(f"正在按指定力度 {force:g} 发射；Esc 可中止蓄力")
+        return "break"
+    buttons = ttk.Frame(frame)
+    buttons.pack(fill="x",pady=(12,0))
+    ttk.Button(buttons,text="取消",command=close_force_dialog).pack(side="right")
+    ttk.Button(buttons,text="发射",command=submit).pack(side="right",padx=8)
+    dialog.bind("<Return>",submit)
+    dialog.bind("<Escape>",close_force_dialog)
+    dialog.protocol("WM_DELETE_WINDOW",close_force_dialog)
+    dialog.grab_set()
+    entry.focus_force()
+
+
+def clear_results(message):
+    global _last_valid_result, _last_valid_at, _pending_failure, _displayed_result
+    _last_valid_result = _last_valid_at = _pending_failure = None
+    _displayed_result = None
+    _ui["table"].delete(*_ui["table"].get_children())
+    _ui["canvas"].delete("all")
+    _ui["parameters"].delete("all")
+    _ui["summary"].set("等待识别")
+    _ui["status"].set(message)
+
+
+def display_analysis_result(result, now=None):
+    """Retain a complete old snapshot briefly, always labelled as stale."""
+    global _last_valid_result, _last_valid_at, _pending_failure
+    now = time.monotonic() if now is None else now
+    if result.phase in {"computing", "failed"}:
+        _last_valid_result = _last_valid_at = _pending_failure = None
+        render_result(result)
+        return
+    if not result.error:
+        _last_valid_result, _last_valid_at, _pending_failure = result, now, None
+        render_result(result)
+    elif (result.error_kind in {"self_missing", "parameters"}
+          and _last_valid_result is not None and now-_last_valid_at < 2):
+        _pending_failure = result
+        age = now-_last_valid_at
+        render_result(replace(_last_valid_result, stale_age=age,
+                              error=f"旧结果，等待重识别（{age:.1f} 秒前）；{result.error}"))
+    else:
+        _last_valid_result = _last_valid_at = _pending_failure = None
+        render_result(result)
+
+
+def expire_stale_result(now=None):
+    global _last_valid_result, _last_valid_at, _pending_failure
+    now = time.monotonic() if now is None else now
+    if _pending_failure is not None and now-_last_valid_at >= 2:
+        failure = _pending_failure
+        _last_valid_result = _last_valid_at = _pending_failure = None
+        render_result(failure)
+
+
+def select_own_player(event):
+    if _mode != AUTO_MODE or _region_overlay is not None or _window_drag is not None:
+        return
+    table = _ui["table"]
+    if table.identify_region(event.x, event.y) != "cell" or table.identify_column(event.x) != "#1":
+        return
+    row = table.identify_row(event.y)
+    result = _displayed_result
+    if not row or result is None:
+        return
+    if result.stale_age is not None or result.frame is None:
+        _ui["status"].set("请按 t 获取当前截图，再勾选自己")
+        return "break"
+    index = int(row)
+    target = result.targets[index]
+    own_index = None if result.manual_self and target.player.identity == "自己" else index
+    try:
+        _analysis_worker.select_self(result, own_index)
+    except ValueError as exc:
+        _ui["status"].set(str(exc))
+        return "break"
+    _ui["status"].set("已取消手动选择，正在恢复蓝圈识别…" if own_index is None
+                      else f"已选择 {target.player.label} 为自己，正在按显示的截图重算力度…")
+    return "break"
+
+
+def render_result(result):
+    global _preview_photo, _parameter_photos, _displayed_result
+    _displayed_result = result
+    table, canvas = _ui["table"], _ui["canvas"]
+    table.delete(*table.get_children())
+    counts = {kind: sum(t.player.identity == kind for t in result.targets)
+              for kind in ("自己", "队友", "敌人", "身份不确定")}
+    clock = time.strftime("%H:%M:%S", time.localtime(result.timestamp))
+    wind = "—" if result.wind is None else f"{result.wind:.1f} {result.wind_direction}"
+    degree = "—" if result.degree is None else f"{result.degree}°"
+    _ui["summary"].set(f"自己 {counts['自己']} · 队友 {counts['队友']} · 敌人 {counts['敌人']} · 未确认 {counts['身份不确定']}    风力 {wind}    角度 {degree}    更新 {clock}")
+    if result.phase == "computing":
+        status = result.error or "正在计算本次出手力度…"
+    elif result.phase == "complete":
+        status = f"本次计算完成（尝试 {result.attempts} 次）；本轮角度/位置变化时重算，结束后等待下次出手；t 可重算"
+        if result.tracking_note:
+            status += "；"+result.tracking_note
+    elif result.phase == "failed":
+        status = f"本次计算未完成（尝试 {result.attempts} 次）；{result.error}；t 可重试"
+    else:
+        status = result.error or result.tracking_note or "计算完成；t 可重新计算"
+    if result.error_kind in {"self_missing", "self_ambiguous"} and result.targets:
+        status += "；可在左侧“我”列勾选自己后计算"
+    _ui["status"].set(status)
+    for index, target in enumerate(result.targets):
+        fmt = lambda value: "—" if value is None else f"{value:.2f}"
+        checked = "☑" if result.manual_self and target.player.identity == "自己" else "☐"
+        table.insert("", "end", iid=str(index), values=(checked, target.player.label, target.player.identity,
+                     target.direction, fmt(target.dx), fmt(target.dy), fmt(target.force),
+                     "旧结果，等待重识别" if result.stale_age is not None else target.status),
+                     tags=(target.player.identity,))
+    canvas.delete("all")
+    parameter_canvas = _ui["parameters"]
+    parameter_canvas.delete("all")
+    _parameter_photos = []
+    for x, label, crop in ((0, "风力截取", result.wind_image), (130, "角度截取", result.degree_image)):
+        parameter_canvas.create_text(x+58, 8, text=label, fill="#c8ced8", font=("Microsoft YaHei", 8))
+        if crop is not None:
+            image = Image.fromarray(crop)
+            scale = min(116/image.width, 48/image.height)
+            photo = ImageTk.PhotoImage(image.resize((round(image.width*scale), round(image.height*scale)), Image.Resampling.NEAREST))
+            _parameter_photos.append(photo)
+            parameter_canvas.create_image(x, 22, anchor="nw", image=photo)
+    if result.minimap is not None:
+        image = Image.fromarray(result.minimap)
+        factor = min(360 / image.width, 190 / image.height)
+        size = (round(image.width * factor), round(image.height * factor))
+        _preview_photo = ImageTk.PhotoImage(image.resize(size, Image.Resampling.BILINEAR))
+        canvas.create_image(0, 0, anchor="nw", image=_preview_photo)
+        colours = {"自己": "#50cfff", "队友": "#70f898", "敌人": "#ff748d", "身份不确定": "#ffcf65"}
+        for target in result.targets:
+            player = target.player
+            x, y = player.x * factor, player.y * factor
+            canvas.create_oval(x-9, y-9, x+9, y+9, outline=colours[player.identity], width=2)
+            canvas.create_text(min(max(x, 15), size[0]-15), max(y-16, 9),
+                               text=player.label, fill="white", font=("Microsoft YaHei", 10, "bold"))
+
+
+def poll_ui():
+    if _stop_signal:
+        return
+    while True:
+        try:
+            action, value = _ui_actions.get_nowait()
+        except Empty:
+            break
+        if action == "quit":
+            on_destroy()
+            return
+        if action == "clear":
+            clear_results(value)
+        elif action == "mark_region":
+            bind_game_under_mouse()
+        elif action == "cancel_binding":
+            cancel_window_binding()
+        elif action == "force_dialog":
+            open_force_dialog()
+        elif action == "cancel_force":
+            close_force_dialog()
+        elif action == "shot_status":
+            _ui["status"].set(value)
+        elif action == "paused":
+            _analysis_worker.pause()
+            reset_inputs(True)
+            if _region_overlay is not None:
+                cancel_region_selection()
+            _ui["status"].set("已暂停；拖动图标可重新绑定，点击开始恢复自动分析")
+        update_controls()
+    result = _analysis_worker.take_result()
+    if result is not None and _mode == AUTO_MODE:
+        display_analysis_result(result)
+    if _mode == AUTO_MODE:
+        expire_stale_result()
+    _tk.after(100, poll_ui)
+
+
+def build_ui(root):
+    root.title("DSS · 多人力度分析")
+    root.geometry("800x660")
+    root.minsize(760, 600)
+    root.wm_attributes("-topmost", True)
+    root.configure(bg="#20242b")
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    table_font = tkfont.Font(root=root, family="Microsoft YaHei", size=9)
+    style.configure("Treeview", font=table_font, rowheight=table_font.metrics("linespace")+8,
+                    background="#292e38", fieldbackground="#292e38", foreground="white")
+    style.configure("Treeview.Heading", font=table_font, background="#394150", foreground="white")
+    outer = tkinter.Frame(root, bg="#20242b")
+    outer.pack(fill="both", expand=True, padx=12, pady=12)
+    toolbar = tkinter.Frame(outer, bg="#20242b")
+    toolbar.pack(fill="x")
+    mode = tkinter.StringVar(value=AUTO_MODE)
+    selector = ttk.Combobox(toolbar, textvariable=mode, values=(AUTO_MODE, MANUAL_MODE), state="readonly", width=24)
+    selector.pack(side="left")
+    selector.bind("<<ComboboxSelected>>", lambda _: select_mode())
+    finder = tkinter.Canvas(toolbar, width=32, height=32, bg="#20242b", highlightthickness=1,
+                            highlightbackground="#50cfff", cursor="hand2", takefocus=True)
+    finder.pack(side="left", padx=(8, 4))
+    finder.create_oval(7, 7, 25, 25, outline="#50cfff", width=2)
+    finder.create_line(16, 2, 16, 30, fill="#50cfff", width=2)
+    finder.create_line(2, 16, 30, 16, fill="#50cfff", width=2)
+    finder.bind("<ButtonPress-1>", start_window_drag)
+    finder.bind("<ButtonRelease-1>", finish_window_drag)
+    finder.bind("<Escape>", cancel_window_binding)
+    tkinter.Label(toolbar, text="拖动绑定", bg="#20242b", fg="#50cfff").pack(side="left")
+    mark = ttk.Button(toolbar, text="精细校准", command=start_region_selection)
+    mark.pack(side="left", padx=(8, 0))
+    start = ttk.Button(toolbar, text="开始", command=toggle_analysis)
+    start.pack(side="left", padx=8)
+    refresh = ttk.Button(toolbar, text="计算一次 (t)", command=refresh_analysis)
+    refresh.pack(side="left")
+    calibration = tkinter.StringVar(value="绑定窗口：将瞄准图标拖到游戏画面内松开；也可把鼠标放到游戏内按 r")
+    tkinter.Label(outer, textvariable=calibration, bg="#20242b", fg="#50cfff", anchor="w", wraplength=900).pack(fill="x", pady=(10, 0))
+    summary, status = tkinter.StringVar(value="等待识别"), tkinter.StringVar(value="请拖动瞄准图标绑定游戏窗口，无需标记两个角")
+    tkinter.Label(outer, textvariable=summary, bg="#20242b", fg="white", anchor="w", wraplength=750).pack(fill="x", pady=(12, 8))
+    preview = tkinter.Frame(outer, bg="#20242b")
+    preview.pack(fill="x")
+    canvas = tkinter.Canvas(preview, width=360, height=190, bg="#15181f", highlightthickness=0)
+    canvas.pack(side="left")
+    help_frame = tkinter.Frame(preview, bg="#20242b")
+    help_frame.pack(side="left", padx=18)
+    tkinter.Label(help_frame, text="出手时计算，角度/位置变化后重算\n自动计算不发射；ss：指定力度发射\n拖动瞄准图标或 r：绑定鼠标下的游戏\nt：手动计算　Esc：暂停/取消\n蓝圈失败时可在“我”列手动勾选", justify="left",
+                  bg="#20242b", fg="#c8ced8", font=("Microsoft YaHei", 10)).pack(anchor="w")
+    parameters = tkinter.Canvas(help_frame, width=250, height=74, bg="#15181f", highlightthickness=0)
+    parameters.pack(anchor="w", pady=(5, 0))
+    tkinter.Label(outer, textvariable=status, bg="#20242b", fg="#ffcf65", anchor="w", justify="left", wraplength=750).pack(fill="x", pady=8)
+    table_frame = tkinter.Frame(outer)
+    table_frame.pack(fill="both", expand=True)
+    columns = ("我", "编号", "身份", "方向", "水平距离", "高低差", "建议力度", "状态")
+    table = ttk.Treeview(table_frame, columns=columns, show="headings", height=8)
+    for column, width in zip(columns, (36, 48, 72, 45, 80, 70, 82, 250)):
+        width = max(width, table_font.measure(column)+20)
+        if column == "状态":
+            width = max(width, table_font.measure("当前角度没有有效的正力度解")+20)
+        table.heading(column, text=column)
+        table.column(column, width=width, minwidth=width, anchor="center" if column != "状态" else "w", stretch=column == "状态")
+    table.bind("<Button-1>", select_own_player)
+    scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=table.yview)
+    table.configure(yscrollcommand=scrollbar.set)
+    table.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    for identity, colour in (("自己", "#50cfff"), ("队友", "#70f898"), ("敌人", "#ff748d"), ("身份不确定", "#ffcf65")):
+        table.tag_configure(identity, foreground=colour)
+    text_widget = tkinter.Text(outer, height=3, width=1, border=0, bg="#15181f", fg="#c8ced8", state="disabled", wrap="word")
+    text_widget.pack(fill="x", pady=(10, 0))
+    root.update_idletasks()
+    width = min(max(800, root.winfo_reqwidth()), root.winfo_screenwidth()-80)
+    height = min(max(660, root.winfo_reqheight()+64), root.winfo_screenheight()-100)
+    root.geometry(f"{width}x{height}")
+    root.minsize(width, height)
+    return {"mode": mode, "start": start, "refresh": refresh, "summary": summary,
+            "status": status, "canvas": canvas, "table": table, "log": text_widget,
+            "table_font": table_font, "parameters": parameters, "calibration": calibration, "mark": mark,
+            "finder": finder}
 
 
 def run():
-    global _game_config, _tk
+    global _game_config, _tk, _ui, _analysis_worker, _shot_controller
 
     _tk = tkinter.Tk()
-    _tk.title("DSS")
-    _tk.geometry("370x84")
-    _tk.wm_attributes("-topmost", 1, "-alpha", 0.618)
-    _tk.bind("<Destroy>", on_destroy)
-    _tk.configure(bg="#333333")
-
-    text_widget = tkinter.Text(_tk, border=0, bg="#333333", fg="white")
-    text_widget.place(y=10, x=10, height=84)
-    text_widget.config(state="disabled")
-
-    setup_logger(text_widget)
+    _ui = build_ui(_tk)
+    _tk.protocol("WM_DELETE_WINDOW", on_destroy)
+    setup_logger(_ui["log"])
+    _shot_controller = ShotController(lambda: space_press(pause=False),lambda: space_release(pause=False),
+                                     focus_shot_target,verify_shot_target,
+                                     lambda message: _ui_actions.put(("shot_status",message)),
+                                     _PRESS_DURATION_PER_FORCE)
     setup_km(_km_queue)
-    threading.Thread(target=km_listen_queue).start()
+    threading.Thread(target=km_listen_queue, daemon=True).start()
 
     config = load_config(_GAME_CONFIG_PATH)
     if config:
         _game_config = config
 
+    analyzer = SnapshotAnalyzer(recognize_wind, recognize, recognize_ten_units)
+    turn_detector = OwnTurnDetector()
+    _analysis_worker = TurnAnalysisWorker(capture_game_frame, analyzer, turn_detector,
+                                          input_reader=analyzer.probe, active_detector=turn_detector.active)
+    _analysis_worker.configure(_game_config["region"], True)
+    _analysis_worker.start()
+    update_controls()
+    if _game_config["region"][2] > 0:
+        _ui["status"].set("等待轮到你出手；t 可手动计算一次")
+        if _game_config.get("window", {}).get("content"):
+            region_prompt("已加载游戏窗口绑定，移动和缩放后自动跟随；窗口重开后请重新拖动绑定")
+        else:
+            region_prompt("已加载旧区域配置；拖动瞄准图标重新绑定即可自动获取完整游戏画面")
+    _tk.after(100, poll_ui)
+
     logger.info(f"DSS 初始化完毕!{'（配置已加载）' if config else ''}")
     _tk.mainloop()
+
+
+def capture_game_frame(region):
+    config = dict(_game_config)
+    if tuple(config["region"]) == tuple(region):
+        region = resolve_region(config)
+    return _capture_region(region)
 
 
 if __name__ == "__main__":

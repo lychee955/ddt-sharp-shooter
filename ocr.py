@@ -69,24 +69,56 @@ def recognize(region: tuple[int, int, int, int] | np.ndarray) -> str:
     return result
 
 
-def recognize_wind(region: tuple[int, int, int, int] | ndarray) -> tuple[int, bool]:
+def _recognize_red_wind(image: ndarray) -> float | None:
+    """Read the red digits separately from the arrow and wind label."""
+    pixels = image.astype(float)
+    red = ((pixels[:, :, 0] > 150)
+           & (pixels[:, :, 1] < pixels[:, :, 0] * .6)
+           & (pixels[:, :, 2] < pixels[:, :, 0] * .6))
+    components = measure.regionprops(measure.label(red))
+    if not components:
+        return None
+    largest_height = max(p.bbox[2] - p.bbox[0] for p in components)
+    digits = [p for p in components if p.bbox[2] - p.bbox[0] >= largest_height * .6 and p.area >= 4]
+    if largest_height < 6 or len(digits) < 2:
+        return None
+    mask = np.zeros(red.shape, dtype=bool)
+    for prop in digits:
+        mask[tuple(prop.coords.T)] = True
+    ys, xs = np.where(mask)
+    binary = np.where(mask[ys.min():ys.max()+1, xs.min():xs.max()+1], 0, 255).astype(np.uint8)
+    binary = np.pad(binary, 4, constant_values=255)
+    text = _recognize_digit(binary)
+    if not text.isdigit() or not 2 <= len(text) <= 3:
+        raise ValueError("风力数字识别失败，请检查风力显示区域")
+    return int(text) / 10
+
+
+def recognize_wind(region: tuple[int, int, int, int] | ndarray) -> tuple[float, bool]:
     if isinstance(region, np.ndarray):
         image = region
     else:
         image = _capture_region(region)
+
+    red_result = _recognize_red_wind(image)
+    if red_result is not None:
+        return red_result, _left_side_more_dark(image)
+    image = image.copy()
 
     # before everything, try to remove all red color to improve the recognition
     image_bin = _binarize_image_by_reference(np.array(image), (200, 6, 15), 50)
     image[image_bin == 1] = [255, 255, 255]
 
     result = _recognize_digit(image)
+    if not result.isdigit() or not 2 <= len(result) <= 3:
+        raise ValueError("风力数字识别失败，请重新标记游戏区域，检查风力显示是否完整")
     if len(result) == 3:
         result = result[0] + result[2]
 
     try:
         result = int(result) / 10
-    except ValueError:
-        result = 0
+    except ValueError as exc:
+        raise ValueError("风力数字识别失败，请检查风力显示区域") from exc
 
     if result < 1:
         image_gray = color.rgb2gray(image)
@@ -94,6 +126,8 @@ def recognize_wind(region: tuple[int, int, int, int] | ndarray) -> tuple[int, bo
         image_bin = image_bin[:, : image_bin.shape[1] // 2]
 
         contours = measure.find_contours(image_bin, 0.8)
+        if not contours:
+            raise ValueError("风力整数位轮廓识别失败，请检查风力显示是否被遮挡")
         largest_contour = max(contours, key=len)
         min_x = int(np.min(largest_contour[:, 1]))
         max_x = int(np.max(largest_contour[:, 1]))
@@ -107,6 +141,8 @@ def recognize_wind(region: tuple[int, int, int, int] | ndarray) -> tuple[int, bo
         image_bin = image_bin[:, image_bin.shape[1] // 2 :]
 
         contours = measure.find_contours(image_bin, 0.8)
+        if not contours:
+            raise ValueError("风力小数位轮廓识别失败，请检查风力显示是否被遮挡")
         largest_contour = max(contours, key=len)
         min_x = int(np.min(largest_contour[:, 1]))
         max_x = int(np.max(largest_contour[:, 1]))
@@ -173,7 +209,7 @@ def _binarize_image_by_reference(
     return image
 
 
-def _recognize_rect_width(image: ndarray) -> tuple[int, int, int, int]:
+def _recognize_rect_width(image: ndarray) -> int:
     """
     Recognize width of the rectangle in the image.
 
@@ -181,7 +217,7 @@ def _recognize_rect_width(image: ndarray) -> tuple[int, int, int, int]:
         image (ndarray): The input image (should be rgb image).
 
     Returns:
-        Tuple[int, int, int, int]: The coordinates of the rectangle (x, y, w, h).
+        int: The width of the rectangle, or 0 if no valid width is found.
     """
     target_color = np.array([160, 163, 169])
     image = _binarize_image_by_reference(image, target_color, 40)
@@ -189,17 +225,41 @@ def _recognize_rect_width(image: ndarray) -> tuple[int, int, int, int]:
     if _DEV:
         io.imsave("tmp.png", image)
 
-    # 分别找到左右第一个白色像素占比超过 1/3 的列
-    left_side = 0
-    right_side = 0
-    for i in range(image.shape[1]):
-        if np.sum(image[:, i]) > image.shape[0] / 4:
-            left_side = i
-            break
-    for i in range(image.shape[1] - 1, -1, -1):
-        if np.sum(image[:, i]) > image.shape[0] / 4:
-            right_side = i
-            break
+    # The full minimap also has a grey outer frame. Identify a horizontal
+    # viewport edge with two vertical sides instead of using the outermost
+    # grey columns (which would measure the entire map).
+    height, width = image.shape
+    minimum_height = max(8, height // 4)
+    best_score, left_side, right_side = 0, 0, 0
+    for y, row in enumerate(image):
+        edges = np.diff(np.r_[False, row, False].astype(int))
+        for left, stop in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+            right = stop - 1
+            if not max(12, width * .1) <= right-left < width * .9:
+                continue
+            # Antialiasing/background can extend a horizontal run a few
+            # pixels past its vertical border. Align each end to an actual
+            # vertical line, rather than accepting an unrelated grey patch.
+            margin = max(2, round(height/60))
+            offsets = [0] + [offset for d in range(1, margin+1) for offset in (-d, d)]
+            columns = [np.array([x+d for d in offsets if 0 <= x+d < width])
+                       for x in (left, right)]
+            for direction in (-1, 1):
+                available = y if direction == -1 else height-y-1
+                if available < minimum_height:
+                    continue
+                indices = y + direction * np.arange(1, available+1)
+                lengths = np.arange(1, available+1)
+                side_coverage = [np.cumsum(image[indices[:, None], cols], axis=0)/lengths[:, None]
+                                 for cols in columns]
+                coverage = np.minimum(*(values.max(axis=1) for values in side_coverage))
+                valid = (lengths >= minimum_height) & (coverage >= .7)
+                score = float(np.max(np.where(valid, coverage*lengths, 0)))
+                if score > best_score:
+                    best = int(np.argmax(np.where(valid, coverage*lengths, 0)))
+                    left_side, right_side = (int(cols[np.argmax(values[best])])
+                                            for cols, values in zip(columns, side_coverage))
+                    best_score = score
     w = right_side - left_side
 
     if _DEV:
@@ -225,7 +285,7 @@ def _recognize_rect_width(image: ndarray) -> tuple[int, int, int, int]:
     return w
 
 
-def recognize_ten_units(region: tuple[int, int, int, int] | ndarray) -> tuple[int, int]:
+def recognize_ten_units(region: tuple[int, int, int, int] | ndarray) -> int:
     """
     Recognize the ten units in the image.
 
@@ -233,7 +293,7 @@ def recognize_ten_units(region: tuple[int, int, int, int] | ndarray) -> tuple[in
         region (tuple[int, int, int, int]): The region to capture.
 
     Returns:
-        tuple[int, int]: The ten units.
+        int: The pixel width corresponding to ten units.
     """
     if isinstance(region, np.ndarray):
         image = region

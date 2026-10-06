@@ -6,6 +6,8 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
+        ('assets/own_turn_banner.png','assets'),
+        ('assets/own_turn_pass.png','assets'),
         ('C:\\Projects\\boring-plans\\ddt-sharp-shooter\\.venv\\Lib\\site-packages\\onnxruntime\\capi\\onnxruntime_providers_shared.dll','onnxruntime\\capi'),
         ('C:\\Projects\\boring-plans\\ddt-sharp-shooter\\.venv\\Lib\\site-packages\\ddddocr\\common.onnx','ddddocr'),
         ('C:\\Projects\\boring-plans\\ddt-sharp-shooter\\.venv\\Lib\\site-packages\\ddddocr\\common_old.onnx','ddddocr'),
